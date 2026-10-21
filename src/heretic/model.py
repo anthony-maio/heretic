@@ -51,6 +51,88 @@ def strftime_fixed_date(format: str) -> str:
     return datetime(2026, 1, 1, tzinfo=timezone.utc).strftime(format)
 
 
+def get_norm_gain(norm: Module, dim: int, device: torch.device) -> Tensor:
+    # An alternating +1/-1 probe has zero mean and unit RMS, so both LayerNorm's
+    # centering and RMSNorm's rescaling leave it unchanged. Pushing it and its negation
+    # through the norm and halving the difference cancels any bias. What's left is
+    # the per-channel gain, regardless of whether the model stores it as w or 1 + w.
+    probe = torch.ones(1, dim, device=device, dtype=torch.float32)
+    probe[:, 1::2] = -1
+
+    with torch.no_grad():
+        gain = (norm(probe).float() - norm(-probe).float()) / (2 * probe)
+
+    return gain.squeeze(0).cpu()
+
+
+def trace_post_norm_gains(
+    layers: ModuleList,
+    layer_modules: list[dict[str, list[Module]]],
+    run_forward: Callable[[], Any],
+) -> dict[tuple[int, str, int], Tensor]:
+    # Some architectures (Gemma 2 and later, OLMo 2, Muse Glimmer) normalize the output
+    # of the attention and MLP blocks before adding it to the residual stream:
+    #
+    #     h = h + norm(W x)
+    #
+    # An RMSNorm divides by a scalar and then multiplies by a per-channel gain g,
+    # so the component of the block's contribution along a direction v is proportional
+    # to (g * v) . (W x), not v . (W x). Ablating v from W therefore leaves part of v
+    # in the residual stream. Ablating g * v instead removes it.
+    #
+    # Module names can't tell these architectures apart: Llama calls its pre-MLP norm
+    # "post_attention_layernorm", and some models call their pre-norms "post_*".
+    # So we trace a forward pass and look for norms whose input is the exact tensor
+    # that an abliterable module returned.
+    #
+    # Returns the gain of that norm, keyed by (layer index, component, module index),
+    # for every module whose output feeds one.
+    module_outputs: dict[tuple[int, str, int], Tensor] = {}
+    norm_inputs: list[tuple[Module, Tensor]] = []
+    hook_handles: list[RemovableHandle] = []
+
+    def get_output_hook(key: tuple[int, str, int]) -> Callable[..., None]:
+        def hook(module: Module, inputs: tuple[Tensor, ...], outputs: Tensor) -> None:
+            module_outputs[key] = outputs
+
+        return hook
+
+    def norm_input_hook(module: Module, inputs: tuple[Tensor, ...]) -> None:
+        if inputs and isinstance(inputs[0], Tensor):
+            norm_inputs.append((module, inputs[0]))
+
+    for layer_index, layer in enumerate(layers):
+        for component, modules in layer_modules[layer_index].items():
+            for module_index, module in enumerate(modules):
+                hook_handles.append(
+                    module.register_forward_hook(
+                        get_output_hook((layer_index, component, module_index))
+                    )
+                )
+
+        for submodule in layer.modules():
+            if "norm" in type(submodule).__name__.lower():
+                hook_handles.append(
+                    submodule.register_forward_pre_hook(norm_input_hook)
+                )
+
+    try:
+        run_forward()
+    finally:
+        for hook_handle in hook_handles:
+            hook_handle.remove()
+
+    gains = {}
+
+    for key, output in module_outputs.items():
+        for norm, norm_input in norm_inputs:
+            if norm_input is output:
+                gains[key] = get_norm_gain(norm, output.shape[-1], output.device)
+                break
+
+    return gains
+
+
 def chat_template_supports_system_role(tokenizer: PreTrainedTokenizerBase) -> bool:
     # Some chat templates (e.g. Gemma 2 and its fine-tunes) reject the system role
     # outright, raising when one is present; others silently drop it. The only
@@ -836,6 +918,18 @@ class Model:
                     module_io[layer_index][component][module_index] = (input, output)
 
         return module_io
+
+    def get_post_norm_gains(self) -> dict[tuple[int, str, int], Tensor]:
+        layers = self.get_layers()
+
+        return trace_post_norm_gains(
+            layers,
+            [self.get_layer_modules(i) for i in range(len(layers))],
+            lambda: self.generate(
+                [Prompt(system=self.settings.system_prompt, user="What is 1+1?")],
+                max_new_tokens=1,
+            ),
+        )
 
     def get_logits(self, prompts: list[Prompt]) -> Tensor:
         # We only generate one token, and we return the raw logits over the vocabulary

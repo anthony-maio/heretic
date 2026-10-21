@@ -133,6 +133,17 @@ class Settings(BaseModel):
         ),
     )
 
+    post_norm_correction: bool = Field(
+        default=False,
+        description=(
+            "Whether to correct the ablated direction for modules whose output passes through "
+            "a normalization layer before reaching the residual stream (Gemma 2 and later, "
+            "OLMo 2, Muse Glimmer). Without the correction, the norm's per-channel gain lets "
+            "part of the refusal direction back into the residual stream. Modules are detected "
+            "by tracing a forward pass, so this does nothing on models without such norms."
+        ),
+    )
+
 
 class Abliteration(Modifier[Parameters]):
     settings: Settings
@@ -211,6 +222,24 @@ class Abliteration(Modifier[Parameters]):
                 self.residual_directions,
                 p=2,
                 dim=1,
+            )
+
+        # Keyed by (layer index, component, module index), because PEFT replaces
+        # the module objects when the adapters are applied below.
+        self.post_norm_gains: dict[tuple[int, str, int], Tensor] = {}
+
+        if self.settings.post_norm_correction:
+            print()
+            print("Looking for modules that feed a post-norm...")
+            self.post_norm_gains = model.get_post_norm_gains()
+            n_modules = sum(
+                len(modules)
+                for layer_index in range(len(model.get_layers()))
+                for modules in model.get_layer_modules(layer_index).values()
+            )
+            print(
+                f"* [bold]{len(self.post_norm_gains)}[/] of [bold]{n_modules}[/] modules, "
+                "the ablated direction will be corrected for their norm's gain"
             )
 
         if self.settings.row_normalization != RowNormalization.FULL:
@@ -358,7 +387,7 @@ class Abliteration(Modifier[Parameters]):
                 else:
                     layer_residual_direction = residual_direction
 
-                for module in modules:
+                for module_index, module in enumerate(modules):
                     # FIXME: This cast is potentially invalid, because the program logic
                     #        does not guarantee that the module is of type Linear, and in fact
                     #        the retrieved modules might not conform to the interface assumed
@@ -375,6 +404,14 @@ class Abliteration(Modifier[Parameters]):
                     # Use the FP32 residual direction directly (no downcast/upcast)
                     # and move to the correct device.
                     v = layer_residual_direction.to(module.weight.device)
+
+                    gain = self.post_norm_gains.get(
+                        (layer_index, component, module_index)
+                    )
+                    if gain is not None:
+                        # The module's output reaches the residual stream as s * g * (W x),
+                        # so its component along v is s * (g * v) . (W x).
+                        v = F.normalize(v * gain.to(v.device), p=2, dim=0)
 
                     # Get W (dequantize if necessary).
                     #
