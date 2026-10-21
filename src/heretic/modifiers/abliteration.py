@@ -122,6 +122,23 @@ class Settings(BaseModel):
         ),
     )
 
+    direction_index_range: tuple[float, float] = Field(
+        default=(0.4, 0.9),
+        description=(
+            "Range the optimizer samples a single (global) refusal direction from, "
+            "as fractions of the layer stack's depth."
+        ),
+    )
+
+    max_weight_position_range: tuple[float, float] = Field(
+        default=(0.6, 1.0),
+        description=(
+            "Range the optimizer samples each component's peak ablation layer from, "
+            "as fractions of the layer stack's depth. Models whose refusal behavior "
+            "is controlled from earlier layers need a lower bound below the default."
+        ),
+    )
+
     winsorization_quantile: float = Field(
         default=1.0,
         description=(
@@ -246,8 +263,8 @@ class Abliteration(Modifier[Parameters]):
         # work with conditional or variable-range parameters.
         direction_index = trial.suggest_float(
             "direction_index",
-            0.4 * last_layer_index,
-            0.9 * last_layer_index,
+            self.settings.direction_index_range[0] * last_layer_index,
+            self.settings.direction_index_range[1] * last_layer_index,
         )
 
         if direction_scope == "per layer":
@@ -278,8 +295,8 @@ class Abliteration(Modifier[Parameters]):
             )
             max_weight_position = trial.suggest_float(
                 f"{component}.max_weight_position",
-                0.6 * last_layer_index,
-                1.0 * last_layer_index,
+                self.settings.max_weight_position_range[0] * last_layer_index,
+                self.settings.max_weight_position_range[1] * last_layer_index,
             )
             # For sampling purposes, min_weight is expressed as a fraction of max_weight,
             # again because multivariate TPE doesn't support variable-range parameters.
